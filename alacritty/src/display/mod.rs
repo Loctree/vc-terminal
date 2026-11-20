@@ -1427,7 +1427,10 @@ impl Display {
         let num_lines = self.size_info.screen_lines();
         for (hint, hint_age, reset_mouse) in hints {
             let (start, end) = match hint {
-                Some(hint) => (*hint.bounds().start(), *hint.bounds().end()),
+                Some(hint) => {
+                    let extent = hint.extent();
+                    (*extent.start(), *extent.end())
+                },
                 None => continue,
             };
 

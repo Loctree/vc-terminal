@@ -33,6 +33,9 @@ Notable changes to the `alacritty_terminal` crate are documented in its
 - Cmd+T opens an independent macOS window and automatic native window tabbing
   is disabled; standalone launches explicitly use regular activation and Dock ownership
 - macOS blur used winit's fixed radius of 80, washing translucent windows out into a grey haze
+- Clicking a URL or path that a program or a vc-frame pane broke across rows opened only
+  its first row; a hint that fills its row up to the pane rule or window edge now
+  continues with the first word of the next row
 - Spurious "Failed to set new owner of XCB selection" warnings on X11
 - Lacking permissions to launch software sending Apple events
 
