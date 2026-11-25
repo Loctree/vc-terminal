@@ -8,20 +8,28 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 DIST_DIR="${DIST_DIR:-$REPO_ROOT/dist}"
 CARGO="${CARGO:-cargo}"
+TARGET_TRIPLE="${TARGET_TRIPLE:-}"
 DO_BUILD=1
 DO_DMG=1
-for arg in "$@"; do
-  case "$arg" in
+while (( $# > 0 )); do
+  case "$1" in
     --skip-build) DO_BUILD=0 ;;
     --skip-dmg|--app-only) DO_DMG=0 ;;
+    --target)
+      shift
+      (( $# > 0 )) || { printf 'Missing value for --target\n' >&2; exit 2; }
+      TARGET_TRIPLE="$1" ;;
+    --target=*)
+      TARGET_TRIPLE="${1#--target=}" ;;
     --no-notarize) ;; # Compatibility with the recovered local-build invocation.
     -h|--help)
-      printf 'Usage: %s [--skip-build] [--skip-dmg]\n' "$0"
+      printf 'Usage: %s [--skip-build] [--skip-dmg] [--target <triple>]\n' "$0"
       printf 'Outputs: DIST_DIR/vc-terminal.app and DIST_DIR/vc-terminal.dmg (default: repo/dist).\n'
       printf 'Developer ID team MW223P3NPX when available, otherwise ad-hoc. No notarization or install.\n'
       exit 0 ;;
-    *) printf 'Unknown argument: %s\n' "$arg" >&2; exit 2 ;;
+    *) printf 'Unknown argument: %s\n' "$1" >&2; exit 2 ;;
   esac
+  shift
 done
 
 log() { printf '[vc-terminal] %s\n' "$*"; }
@@ -46,20 +54,38 @@ metadata="$("$CARGO" metadata --no-deps --format-version=1)"
 APP_VERSION="$(printf '%s' "$metadata" | python3 -c 'import json,sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"] == "alacritty"))')"
 TARGET_DIR="$(printf '%s' "$metadata" | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')"
 if (( DO_BUILD )); then
-  make --no-print-directory -C "$REPO_ROOT" release-bins CARGO="$CARGO"
+  if [[ -n "$TARGET_TRIPLE" ]]; then
+    MACOSX_DEPLOYMENT_TARGET="10.12" "$CARGO" build --release --target "$TARGET_TRIPLE"
+  else
+    make --no-print-directory -C "$REPO_ROOT" release-bins CARGO="$CARGO"
+  fi
 fi
-BINARY="$TARGET_DIR/release/alacritty"
+if [[ -n "$TARGET_TRIPLE" ]]; then
+  BINARY="$TARGET_DIR/$TARGET_TRIPLE/release/alacritty"
+else
+  BINARY="$TARGET_DIR/release/alacritty"
+fi
 [[ -x "$BINARY" ]] || die "missing release binary: $BINARY"
 COMMIT_FULL="$(git rev-parse HEAD)"
 COMMIT_SHORT="$(git rev-parse --short HEAD)"
-VERSION_OUTPUT="$("$BINARY" --version)"
-[[ "$VERSION_OUTPUT" == "alacritty $APP_VERSION ($COMMIT_SHORT)" ]] \
-  || die "binary does not match Cargo version and HEAD: $VERSION_OUTPUT (rebuild release-bins)"
+if [[ -z "$TARGET_TRIPLE" || "$TARGET_TRIPLE" == "$(uname -m)-apple-darwin" || ( "$TARGET_TRIPLE" == "aarch64-apple-darwin" && "$(uname -m)" == "arm64" ) ]]; then
+  VERSION_OUTPUT="$("$BINARY" --version)"
+  [[ "$VERSION_OUTPUT" == "alacritty $APP_VERSION ($COMMIT_SHORT)" ]] \
+    || die "binary does not match Cargo version and HEAD: $VERSION_OUTPUT (rebuild release-bins)"
+else
+  VERSION_OUTPUT="alacritty $APP_VERSION ($COMMIT_SHORT)"
+fi
 
-# Use only the existing Developer ID keychain identity; never import keys or
-# change the user's keychain search list. Signing failure is fatal.
-SIGNING_IDENTITY="$(security find-identity -v -p codesigning | awk '/"Developer ID Application: .*\(MW223P3NPX\)"/ {print $2; exit}')"
-SIGN_ARGS=(--force --options runtime)
+# Use only the existing Developer ID keychain identity (or explicit CI keychain
+# from VC_SIGNING_KEYCHAIN); never change the user's keychain search list.
+KEYCHAIN_ARGS=()
+if [[ -n "${VC_SIGNING_KEYCHAIN:-}" ]]; then
+  SIGNING_IDENTITY="$(security find-identity -v -p codesigning "$VC_SIGNING_KEYCHAIN" | awk '/"Developer ID Application: .*\(MW223P3NPX\)"/ {print $2; exit}')"
+  KEYCHAIN_ARGS=(--keychain "$VC_SIGNING_KEYCHAIN")
+else
+  SIGNING_IDENTITY="$(security find-identity -v -p codesigning | awk '/"Developer ID Application: .*\(MW223P3NPX\)"/ {print $2; exit}')"
+fi
+SIGN_ARGS=(--force --options runtime ${KEYCHAIN_ARGS[@]+"${KEYCHAIN_ARGS[@]}"})
 if [[ -n "$SIGNING_IDENTITY" ]]; then
   SIGN_ARGS+=(--sign "$SIGNING_IDENTITY" --timestamp)
   log "Signing with Developer ID team MW223P3NPX ($SIGNING_IDENTITY)"
@@ -215,8 +241,10 @@ done < <(find "$FRAMEWORKS_DIR" -type f -name '*.dylib' -print0)
 codesign "${SIGN_ARGS[@]}" --entitlements "$ENTITLEMENTS" "$APP_BUNDLE/Contents/MacOS/vc-terminal"
 codesign "${SIGN_ARGS[@]}" --entitlements "$ENTITLEMENTS" "$APP_BUNDLE"
 codesign --verify --deep --strict --verbose=2 "$APP_BUNDLE"
-[[ "$("$APP_BUNDLE/Contents/MacOS/vc-terminal" --version)" == "$VERSION_OUTPUT" ]] \
-  || die 'packaged binary version changed'
+if [[ -z "$TARGET_TRIPLE" || "$TARGET_TRIPLE" == "$(uname -m)-apple-darwin" || ( "$TARGET_TRIPLE" == "aarch64-apple-darwin" && "$(uname -m)" == "arm64" ) ]]; then
+  [[ "$("$APP_BUNDLE/Contents/MacOS/vc-terminal" --version)" == "$VERSION_OUTPUT" ]] \
+    || die 'packaged binary version changed'
+fi
 
 if (( DO_DMG )); then
   DMG_STAGING="$STAGING_DIR/dmg"

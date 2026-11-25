@@ -1,0 +1,364 @@
+name: Release
+
+# Multi-OS standalone release pipeline for vc-terminal (aligned with Loctree org signing):
+# - macOS (arm64 + x86_64): Developer ID codesign + Apple notarization + staple + .notary.json + GPG .asc + .sha256
+# - Linux (x86_64 + arm64): .tar.gz + GPG .asc + .sha256 + GitHub OIDC attestation
+# - Windows (x86_64): .zip + GPG .asc + .sha256 + GitHub OIDC attestation (+ optional Authenticode when thumbprint is configured)
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      notarize:
+        description: Submit macOS artifacts to Apple notary service
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  verify-release:
+    name: Verify release contract
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Verify version matches tag
+        run: |
+          set -euo pipefail
+          version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' alacritty/Cargo.toml | head -n 1)"
+          test -n "$version"
+          if [ "$GITHUB_EVENT_NAME" = "push" ]; then
+            test "${GITHUB_REF#refs/tags/v}" = "$version" || {
+              echo "::error::tag ${GITHUB_REF#refs/tags/} does not match alacritty/Cargo.toml version $version" >&2
+              exit 1
+            }
+          fi
+
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake pkg-config libfreetype6-dev libfontconfig1-dev \
+            libxcb-xfixes0-dev libxkbcommon-dev
+
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
+        with:
+          components: clippy
+          cache: false
+
+      - name: Run workspace tests and clippy
+        run: |
+          cargo test
+          cargo test -p alacritty_terminal --no-default-features
+          cargo clippy --all-targets -- -D warnings
+
+  build-macos:
+    name: Build macOS (${{ matrix.target }})
+    needs: verify-release
+    runs-on: macos-15
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - aarch64-apple-darwin
+          - x86_64-apple-darwin
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Install macOS packaging tools
+        run: brew install scdoc
+
+      - name: Install Rust target
+        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
+        with:
+          target: ${{ matrix.target }}
+          cache: false
+
+      - name: Build, Developer ID sign, and notarize vc-terminal
+        env:
+          VC_CERT_P12_B64: ${{ secrets.LOCTREE_MACOS_CERT_P12_BASE64 || secrets.VC_CERT_P12_B64 }}
+          VC_CERT_PASSWORD: ${{ secrets.LOCTREE_MACOS_CERT_PASSWORD || secrets.VC_CERT_PASSWORD }}
+          VC_SIGNING_IDENTITY: ${{ secrets.LOCTREE_MACOS_SIGNING_IDENTITY || secrets.VC_SIGNING_IDENTITY }}
+          VC_NOTARY_API_KEY_B64: ${{ secrets.VC_NOTARY_API_KEY_B64 }}
+          VC_NOTARY_API_KEY_ID: ${{ secrets.VC_NOTARY_API_KEY_ID }}
+          VC_NOTARY_API_ISSUER: ${{ secrets.VC_NOTARY_API_ISSUER }}
+          VC_NOTARY_APPLE_ID: ${{ secrets.LOCTREE_NOTARY_APPLE_ID || secrets.VC_NOTARY_APPLE_ID }}
+          VC_NOTARY_PASSWORD: ${{ secrets.LOCTREE_NOTARY_PASSWORD || secrets.VC_NOTARY_PASSWORD }}
+          VC_NOTARY_TEAM_ID: ${{ secrets.LOCTREE_NOTARY_TEAM_ID || secrets.VC_NOTARY_TEAM_ID }}
+          DO_NOTARIZE: ${{ (github.event_name == 'workflow_dispatch' && inputs.notarize == false) && '0' || '1' }}
+        run: |
+          set -euo pipefail
+          for name in VC_CERT_P12_B64 VC_CERT_PASSWORD VC_SIGNING_IDENTITY; do
+            [[ -n "${!name:-}" ]] || { echo "::error::missing secret $name"; exit 1; }
+          done
+          umask 077
+          signing_dir="$(mktemp -d "$RUNNER_TEMP/vc-terminal-sign.XXXXXX")"
+          keychain="$signing_dir/signing.keychain-db"
+          cleanup() {
+            security delete-keychain "$keychain" >/dev/null 2>&1 || true
+            rm -rf "$signing_dir"
+          }
+          trap cleanup EXIT
+          keychain_password="$(openssl rand -hex 32)"
+          security create-keychain -p "$keychain_password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+          printf '%s' "$VC_CERT_P12_B64" | base64 --decode > "$signing_dir/certificate.p12"
+          security import "$signing_dir/certificate.p12" -k "$keychain" \
+            -P "$VC_CERT_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "$keychain_password" "$keychain" >/dev/null
+          curl -fsSL https://www.apple.com/certificateauthority/DeveloperIDG2CA.cer \
+            -o "$signing_dir/DeveloperIDG2CA.cer"
+          security import "$signing_dir/DeveloperIDG2CA.cer" -k "$keychain" -T /usr/bin/codesign
+
+          mkdir -p release-out
+          DIST_DIR="$PWD/release-out/staging" VC_SIGNING_KEYCHAIN="$keychain" \
+            bash scripts/build-vc-terminal-release.sh --target "${{ matrix.target }}"
+
+          app_path="release-out/staging/vc-terminal.app"
+          dmg_src="release-out/staging/vc-terminal.dmg"
+          dmg_name="vc-terminal-${{ matrix.target }}.dmg"
+          zip_name="vc-terminal-${{ matrix.target }}.zip"
+          mv "$dmg_src" "release-out/$dmg_name"
+          ditto -c -k --keepParent "$app_path" "release-out/$zip_name"
+
+          if [[ "$DO_NOTARIZE" == "1" ]]; then
+            if [[ -n "$VC_NOTARY_API_KEY_B64" && -n "$VC_NOTARY_API_KEY_ID" && -n "$VC_NOTARY_API_ISSUER" ]]; then
+              printf '%s' "$VC_NOTARY_API_KEY_B64" | base64 --decode > "$signing_dir/notary.p8"
+              xcrun notarytool store-credentials vc-terminal-ci-notary --keychain "$keychain" \
+                --key "$signing_dir/notary.p8" --key-id "$VC_NOTARY_API_KEY_ID" \
+                --issuer "$VC_NOTARY_API_ISSUER"
+            elif [[ -n "$VC_NOTARY_APPLE_ID" && -n "$VC_NOTARY_PASSWORD" && -n "$VC_NOTARY_TEAM_ID" ]]; then
+              xcrun notarytool store-credentials vc-terminal-ci-notary --keychain "$keychain" \
+                --apple-id "$VC_NOTARY_APPLE_ID" --password "$VC_NOTARY_PASSWORD" \
+                --team-id "$VC_NOTARY_TEAM_ID"
+            else
+              echo "::error::provide a complete notary API key or Apple ID credential set" >&2
+              exit 1
+            fi
+            xcrun notarytool submit "release-out/$zip_name" \
+              --keychain-profile vc-terminal-ci-notary --keychain "$keychain" \
+              --wait --timeout 30m --output-format json > "release-out/${zip_name%.zip}.notary.json"
+            jq -e '.status == "Accepted"' "release-out/${zip_name%.zip}.notary.json"
+            xcrun stapler staple "$app_path"
+            xcrun stapler validate "$app_path"
+            spctl -a -t exec -vv "$app_path"
+            rm -f "release-out/$zip_name"
+            ditto -c -k --keepParent "$app_path" "release-out/$zip_name"
+
+            xcrun notarytool submit "release-out/$dmg_name" \
+              --keychain-profile vc-terminal-ci-notary --keychain "$keychain" \
+              --wait --timeout 30m --output-format json > "release-out/${dmg_name%.dmg}.dmg.notary.json"
+            jq -e '.status == "Accepted"' "release-out/${dmg_name%.dmg}.dmg.notary.json"
+            xcrun stapler staple "release-out/$dmg_name"
+            xcrun stapler validate "release-out/$dmg_name"
+            spctl -a -t open --context context:primary-signature -vv "release-out/$dmg_name"
+          fi
+
+          rm -rf release-out/staging
+          if [[ "${{ matrix.target }}" == "aarch64-apple-darwin" ]]; then
+            cp "release-out/$dmg_name" "release-out/vc-terminal.dmg"
+            (cd release-out && shasum -a 256 "vc-terminal.dmg" > "vc-terminal.dmg.sha256")
+          fi
+          (cd release-out && shasum -a 256 "$zip_name" > "${zip_name}.sha256")
+          (cd release-out && shasum -a 256 "$dmg_name" > "${dmg_name}.sha256")
+
+      - name: Attest macOS zip
+        uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4.2.0
+        with:
+          subject-path: release-out/vc-terminal-${{ matrix.target }}.zip
+
+      - name: Attest macOS dmg
+        uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4.2.0
+        with:
+          subject-path: release-out/vc-terminal-${{ matrix.target }}.dmg
+
+      - name: Upload macOS release artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: dist-macos-${{ matrix.target }}
+          path: release-out/*
+          if-no-files-found: error
+
+  build-linux:
+    name: Build Linux (${{ matrix.target }})
+    needs: verify-release
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake pkg-config libfreetype6-dev libfontconfig1-dev \
+            libxcb-xfixes0-dev libxkbcommon-dev scdoc
+
+      - name: Install Rust target
+        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
+        with:
+          target: ${{ matrix.target }}
+          cache: false
+
+      - name: Build and package Linux binary
+        run: |
+          set -euo pipefail
+          cargo build --release --target "${{ matrix.target }}"
+          mkdir -p release-out/stage
+          cp "target/${{ matrix.target }}/release/alacritty" release-out/stage/vc-terminal
+          chmod +x release-out/stage/vc-terminal
+          asset="vc-terminal-${{ matrix.target }}.tar.gz"
+          tar -czf "release-out/$asset" -C release-out/stage vc-terminal
+          rm -rf release-out/stage
+          (cd release-out && sha256sum "$asset" > "${asset}.sha256")
+
+      - name: Attest Linux archive
+        uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4.2.0
+        with:
+          subject-path: release-out/vc-terminal-${{ matrix.target }}.tar.gz
+
+      - name: Upload Linux release artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: dist-linux-${{ matrix.target }}
+          path: release-out/*
+          if-no-files-found: error
+
+  build-windows:
+    name: Build Windows (x86_64-pc-windows-msvc)
+    needs: verify-release
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - name: Install Rust target
+        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
+        with:
+          target: x86_64-pc-windows-msvc
+          cache: false
+
+      - name: Build, optionally Authenticode-sign, and package Windows binary
+        shell: pwsh
+        env:
+          VC_WINDOWS_AUTHENTICODE_THUMBPRINT: ${{ secrets.VC_WINDOWS_AUTHENTICODE_THUMBPRINT }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          cargo build --release --target x86_64-pc-windows-msvc
+          New-Item -ItemType Directory -Force -Path release-out\stage | Out-Null
+          $exe = "release-out\stage\vc-terminal.exe"
+          Copy-Item "target\x86_64-pc-windows-msvc\release\alacritty.exe" $exe
+          if ($env:VC_WINDOWS_AUTHENTICODE_THUMBPRINT) {
+            # Optional Authenticode slot when a Windows code-signing cert is present in the store.
+            & signtool sign /sha1 $env:VC_WINDOWS_AUTHENTICODE_THUMBPRINT /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 $exe
+            if ($LASTEXITCODE -ne 0) { throw "signtool failed" }
+          }
+          $asset = "vc-terminal-x86_64-pc-windows-msvc.zip"
+          Compress-Archive -Path $exe -DestinationPath "release-out\$asset" -Force
+          Remove-Item -Recurse -Force release-out\stage
+          $hash = (Get-FileHash "release-out\$asset" -Algorithm SHA256).Hash.ToLower()
+          "$hash  $asset" | Out-File -Encoding ascii "release-out\$asset.sha256"
+
+      - name: Attest Windows archive
+        uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4.2.0
+        with:
+          subject-path: release-out/vc-terminal-x86_64-pc-windows-msvc.zip
+
+      - name: Upload Windows release artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: dist-windows-x86_64
+          path: release-out/*
+          if-no-files-found: error
+
+  sign-and-publish:
+    name: GPG sign all OS assets and publish release
+    needs: [verify-release, build-macos, build-linux, build-windows]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@fa0a91b85d4f4041e017790ed8e50bd4db7168b5 # v4
+        with:
+          path: dist-in
+          merge-multiple: true
+
+      - name: GPG-sign macOS, Linux, and Windows archives and generate SHA256SUMS
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.LOCTREE_GPG_PRIVATE_KEY || secrets.GPG_PRIVATE_KEY }}
+          GPG_PASSPHRASE: ${{ secrets.LOCTREE_GPG_PASSPHRASE || secrets.GPG_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+          test -n "${GPG_PRIVATE_KEY:-}" || {
+            echo "::error::LOCTREE_GPG_PRIVATE_KEY (or GPG_PRIVATE_KEY) is required" >&2
+            exit 1
+          }
+          signing_home="$(mktemp -d)"
+          chmod 700 "$signing_home"
+          trap 'gpgconf --homedir "$signing_home" --kill all 2>/dev/null || true; rm -rf "$signing_home"' EXIT
+          printf '%s\n' "$GPG_PRIVATE_KEY" | gpg --homedir "$signing_home" --batch --import
+          gpg_args=(--homedir "$signing_home" --batch --yes --armor --pinentry-mode loopback)
+          if [ -n "${GPG_PASSPHRASE:-}" ]; then
+            gpg_args+=(--passphrase "$GPG_PASSPHRASE")
+          fi
+          mkdir -p dist-pub
+          cp dist-in/* dist-pub/
+          cd dist-pub
+          for f in *.tar.gz *.zip *.dmg; do
+            [ -f "$f" ] || continue
+            gpg "${gpg_args[@]}" --detach-sign --output "${f}.asc" "$f"
+            gpg --homedir "$signing_home" --batch --verify "${f}.asc" "$f"
+          done
+          sha256sum *.tar.gz *.zip *.dmg | LC_ALL=C sort -k2 > SHA256SUMS
+          gpg "${gpg_args[@]}" --detach-sign --output SHA256SUMS.asc SHA256SUMS
+          gpg --homedir "$signing_home" --batch --armor --export > loctree-release-pubkey.asc
+
+      - name: Publish GitHub Release
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF#refs/tags/}"
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$tag" dist-pub/* --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$tag" dist-pub/* --repo "$GITHUB_REPOSITORY" --title "vc-terminal ${tag#v}" --generate-notes
+          fi
+
+      - name: Upload candidate bundle on workflow_dispatch
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: vc-terminal-release-candidate-${{ github.run_id }}
+          path: dist-pub/*
+          if-no-files-found: error
