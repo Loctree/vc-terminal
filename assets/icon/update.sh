@@ -1,13 +1,23 @@
 #!/usr/bin/env bash
 # Build alacritty.icns for the vc-terminal.app bundle from a square master icon.
-# Full-bleed 1:1 — no padding/border (macOS applies its own mask).
+# Preserve the master tile and alpha margin at every representation size.
 # Flow ported from labs/vc-surface (wezterm fork) — same brand mark, same pipeline.
 #
-# Default source: assets/icon/vc-terminal-icon.png (the vc_ brand mark).
+# Default source: assets/icon/vc-terminal-icon.png (static filled Dock tile;
+# see README.md for provenance; independent from the tray template mask).
 # Override: VC_TERMINAL_ICON_SRC=/path/to/icon.png|svg
 set -euo pipefail
 ROOT="$(git rev-parse --show-toplevel)"
 cd "$ROOT/assets/icon"
+
+if [[ -z "${VC_TERMINAL_ICON_SRC:-}" ]]; then
+  if ! command -v swift >/dev/null 2>&1; then
+    echo "native AppKit Swift renderer required to rebuild canonical Dock masters" >&2
+    exit 1
+  fi
+  swift render.swift "$ROOT/assets/icon"
+  cp vc-terminal-icon-dark.png vc-terminal-icon.png
+fi
 
 src="${VC_TERMINAL_ICON_SRC:-$ROOT/assets/icon/vc-terminal-icon.png}"
 if [[ ! -f "$src" ]]; then
@@ -53,10 +63,10 @@ render_png() {
   fi
 }
 
-# Linux / generic 128px (full bleed, no border)
+# Linux / generic 128px (same tile and alpha margin)
 render_png 128 terminal.png
 
-# macOS iconset — 1:1 full bleed at every size (no 10% padding frame)
+# macOS iconset — preserve the master composition at every size
 rm -rf terminal.iconset
 mkdir terminal.iconset
 render_png 16  terminal.iconset/icon_16x16.png

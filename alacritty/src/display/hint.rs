@@ -14,7 +14,7 @@ use alacritty_terminal::term::search::{Match, RegexIter, RegexSearch};
 use alacritty_terminal::term::{Term, TermMode};
 
 use crate::config::UiConfig;
-use crate::config::ui_config::{Hint, HintAction};
+use crate::config::ui_config::{Hint, HintAction, HintMouse};
 
 /// Maximum number of linewraps followed outside of the viewport during search highlighting.
 pub const MAX_SEARCH_LINES: usize = 100;
@@ -163,7 +163,7 @@ impl HintState {
 
             // Hyperlinks take precedence over regex matches.
             let hyperlink = term.grid()[*bounds.start()].hyperlink();
-            Some(HintMatch { bounds, hyperlink, hint })
+            Some(HintMatch { bounds, tail: Vec::new(), hyperlink, hint })
         } else {
             // Store character to preserve the selection.
             self.keys.push(c);
@@ -197,6 +197,9 @@ pub struct HintMatch {
     /// Terminal range matching the hint.
     bounds: Match,
 
+    /// Words continuing the match on the following rows, see [`WrappedMatch`].
+    tail: Vec<Match>,
+
     /// OSC 8 hyperlink.
     hyperlink: Option<Hyperlink>,
 
@@ -208,7 +211,9 @@ impl HintMatch {
     #[inline]
     pub fn should_highlight(&self, point: Point, pointed_hyperlink: Option<&Hyperlink>) -> bool {
         self.hyperlink.as_ref() == pointed_hyperlink
-            && (self.hyperlink.is_some() || self.bounds.contains(&point))
+            && (self.hyperlink.is_some()
+                || self.bounds.contains(&point)
+                || self.tail.iter().any(|word| word.contains(&point)))
     }
 
     #[inline]
@@ -219,6 +224,11 @@ impl HintMatch {
     #[inline]
     pub fn bounds(&self) -> &Match {
         &self.bounds
+    }
+
+    /// Terminal range from the start of the hint to the end of its last row.
+    pub fn extent(&self) -> Match {
+        *self.bounds.start()..=*self.tail.last().unwrap_or(&self.bounds).end()
     }
 
     pub fn hyperlink(&self) -> Option<&Hyperlink> {
@@ -241,12 +251,168 @@ impl HintMatch {
 
         // Revalidate regex match.
         let regex = self.hint.content.regex.as_ref()?;
-        let bounds = regex.with_compiled(|regex| {
-            regex_match_at(term, *self.bounds.start(), regex, self.hint.post_processing)
+        if self.tail.is_empty() {
+            let bounds = regex.with_compiled(|regex| {
+                regex_match_at(term, *self.bounds.start(), regex, self.hint.post_processing)
+            })??;
+            return (bounds == self.bounds)
+                .then(|| term.bounds_to_string(*bounds.start(), *bounds.end()).into());
+        }
+
+        // Revalidate a match hard-wrapped onto the following rows.
+        let wrapped = regex.with_compiled(|regex| {
+            wrapped_regex_match_at(term, *self.bounds.start(), regex, self.hint.post_processing)
         })??;
-        (bounds == self.bounds)
-            .then(|| term.bounds_to_string(*bounds.start(), *bounds.end()).into())
+        (wrapped.head == self.bounds && wrapped.tail == self.tail)
+            .then(|| wrapped.text(term).into())
     }
+}
+
+/// Regex match that a program hard-wrapped at the edge of its text box.
+///
+/// Programs such as Claude Code break long lines with real newlines, and a
+/// multiplexer such as vc-frame redraws its panes with cursor addressing, so
+/// the grid never marks these rows as wrapped and the regex stops at the edge.
+/// A match that fills its row up to the edge of its box continues with the
+/// first word of the next row in the same box.
+#[derive(PartialEq, Eq, Debug, Clone)]
+struct WrappedMatch {
+    /// Regex match the link starts with.
+    head: Match,
+
+    /// Continuation words, one per following row.
+    tail: Vec<Match>,
+}
+
+impl WrappedMatch {
+    /// The link text, without the indentation of its continuation rows.
+    ///
+    /// A segment reaching the last grid column of an unwrapped row reads back
+    /// with a newline; the link continues on the next row instead.
+    fn text<T>(&self, term: &Term<T>) -> String {
+        iter::once(&self.head)
+            .chain(&self.tail)
+            .map(|segment| {
+                let text = term.bounds_to_string(*segment.start(), *segment.end());
+                text.trim_end_matches('\n').to_owned()
+            })
+            .collect()
+    }
+}
+
+/// Retrieve the regex match at `point`, joined across rows hard-wrapped at the
+/// edge of its text box.
+fn wrapped_regex_match_at<T>(
+    term: &Term<T>,
+    point: Point,
+    regex: &mut RegexSearch,
+    post_processing: bool,
+) -> Option<WrappedMatch> {
+    let text_box = text_box(term, point);
+    let right = text_box.1;
+
+    // The match under the point, or the continuation word under it.
+    let mut head = regex_match_at(term, point, regex, post_processing);
+    let mut segment = match &head {
+        Some(head) => head.clone(),
+        None => leading_word(term, point.line, text_box).filter(|word| word.contains(&point))?,
+    };
+
+    // Walk up while the segment opens its row and a match fills the row above.
+    while segment.start().line > term.topmost_line()
+        && leading_word(term, segment.start().line, text_box)
+            .is_some_and(|word| word.start() == segment.start())
+    {
+        let above = Point::new(Line(segment.start().line.0 - 1), right);
+        let Some(previous) = regex_match_at(term, above, regex, post_processing)
+            .filter(|previous| *previous.end() == above)
+        else {
+            break;
+        };
+        head = Some(previous.clone());
+        segment = previous;
+    }
+    let head = head?;
+
+    // Walk down while each segment fills its row up to the edge.
+    let mut tail = Vec::new();
+    let mut end = *head.end();
+    while end.column == right && end.line < term.bottommost_line() {
+        let Some(word) = leading_word(term, Line(end.line.0 + 1), text_box) else {
+            break;
+        };
+        end = *word.end();
+        tail.push(word);
+    }
+    trim_wrapped_tail(term, &head, &mut tail);
+
+    let covered = head.contains(&point) || tail.iter().any(|word| word.contains(&point));
+    covered.then_some(WrappedMatch { head, tail })
+}
+
+/// Drop the sentence punctuation that follows a wrapped link.
+///
+/// A closing bracket stays when the link itself opened it.
+fn trim_wrapped_tail<T>(term: &Term<T>, head: &Match, tail: &mut Vec<Match>) {
+    let Some(last) = tail.last() else {
+        return;
+    };
+    let line = last.end().line;
+    let first = last.start().column.0;
+    let text = WrappedMatch { head: head.clone(), tail: tail.clone() }.text(term);
+    let mut open_parens = text.matches('(').count() as isize - text.matches(')').count() as isize;
+    let mut open_brackets = text.matches('[').count() as isize - text.matches(']').count() as isize;
+
+    let row = &term.grid()[line];
+    let mut end = last.end().column.0 + 1;
+    while end > first {
+        match row[Column(end - 1)].c {
+            '.' | ',' | ':' | ';' | '?' | '!' | '\'' => (),
+            ')' if open_parens < 0 => open_parens += 1,
+            ']' if open_brackets < 0 => open_brackets += 1,
+            _ => break,
+        }
+        end -= 1;
+    }
+
+    if end == first {
+        tail.pop();
+    } else if let Some(last) = tail.last_mut() {
+        *last = *last.start()..=Point::new(line, Column(end - 1));
+    }
+}
+
+/// Columns `[left, right]` of the text box holding `point`: between the
+/// nearest pane rules on its row, or the grid edges.
+fn text_box<T>(term: &Term<T>, point: Point) -> (Column, Column) {
+    let row = &term.grid()[point.line];
+    let last = term.last_column().0;
+    let left = (0..point.column.0)
+        .rev()
+        .find(|&column| is_pane_rule(row[Column(column)].c))
+        .map_or(0, |column| column + 1);
+    let right = (point.column.0 + 1..=last)
+        .find(|&column| is_pane_rule(row[Column(column)].c))
+        .map_or(last, |column| column - 1);
+    (Column(left), Column(right))
+}
+
+/// Vertical rules a multiplexer draws between panes.
+fn is_pane_rule(c: char) -> bool {
+    matches!(c, '│' | '┃' | '║' | '┆' | '┇' | '┊' | '┋')
+}
+
+/// Characters of a URL or a path: letters, digits and the RFC 3986 set.
+fn is_link_char(c: char) -> bool {
+    c.is_alphanumeric() || "-._~:/?#[]@!$&'()*+,;=%".contains(c)
+}
+
+/// The first word inside the box on `line`; blanks before it are indentation.
+fn leading_word<T>(term: &Term<T>, line: Line, (left, right): (Column, Column)) -> Option<Match> {
+    let row = &term.grid()[line];
+    let start = (left.0..=right.0).find(|&column| !matches!(row[Column(column)].c, ' ' | '\t'))?;
+    let end = (start..=right.0).take_while(|&column| is_link_char(row[Column(column)].c)).last()?;
+    Some(Point::new(line, Column(start))..=Point::new(line, Column(end)))
 }
 
 /// Generator for creating new hint labels.
@@ -396,11 +562,8 @@ pub fn highlighted_at<T>(
 
     config.hints.enabled.iter().find_map(|hint| {
         // Check if all required modifiers are pressed.
-        let highlight = hint.mouse.is_some_and(|mouse| {
-            mouse.enabled
-                && mouse_mods.contains(mouse.mods.0)
-                && (!mouse_mode || mouse_mods.contains(ModifiersState::SHIFT))
-        });
+        let highlight =
+            hint.mouse.is_some_and(|mouse| mouse_hint_enabled(mouse_mode, mouse, mouse_mods));
         if !highlight {
             return None;
         }
@@ -408,18 +571,38 @@ pub fn highlighted_at<T>(
         if let Some((hyperlink, bounds)) =
             hint.content.hyperlinks.then(|| hyperlink_at(term, point)).flatten()
         {
-            return Some(HintMatch { bounds, hyperlink: Some(hyperlink), hint: hint.clone() });
+            return Some(HintMatch {
+                bounds,
+                tail: Vec::new(),
+                hyperlink: Some(hyperlink),
+                hint: hint.clone(),
+            });
         }
 
-        let bounds = hint.content.regex.as_ref().and_then(|regex| {
-            regex.with_compiled(|regex| regex_match_at(term, point, regex, hint.post_processing))
+        let wrapped = hint.content.regex.as_ref().and_then(|regex| {
+            regex.with_compiled(|regex| {
+                wrapped_regex_match_at(term, point, regex, hint.post_processing)
+            })
         });
-        if let Some(bounds) = bounds.flatten() {
-            return Some(HintMatch { bounds, hint: hint.clone(), hyperlink: None });
+        if let Some(WrappedMatch { head, tail }) = wrapped.flatten() {
+            return Some(HintMatch { bounds: head, tail, hint: hint.clone(), hyperlink: None });
         }
 
         None
     })
+}
+
+/// Check whether a mouse hint owns the click at the host boundary.
+///
+/// Shift remains the generic escape hatch while an application reports mouse
+/// events. A hint explicitly bound to Command/Super is already an unambiguous
+/// host gesture, so it must not be forwarded to the terminal application.
+fn mouse_hint_enabled(mouse_mode: bool, mouse: HintMouse, mouse_mods: ModifiersState) -> bool {
+    mouse.enabled
+        && mouse_mods.contains(mouse.mods.0)
+        && (!mouse_mode
+            || mouse_mods.contains(ModifiersState::SHIFT)
+            || mouse.mods.0.contains(ModifiersState::SUPER))
 }
 
 /// Retrieve the hyperlink with its range, if there is one at the specified point.
@@ -653,6 +836,17 @@ mod tests {
     }
 
     #[test]
+    fn command_hint_owns_click_during_mouse_reporting() {
+        let mut command_hint = HintMouse { enabled: true, ..Default::default() };
+        command_hint.mods.0 = ModifiersState::SUPER;
+        let plain_hint = HintMouse { enabled: true, ..Default::default() };
+
+        assert!(mouse_hint_enabled(true, command_hint, ModifiersState::SUPER));
+        assert!(!mouse_hint_enabled(true, plain_hint, ModifiersState::SUPER));
+        assert!(mouse_hint_enabled(true, plain_hint, ModifiersState::SHIFT));
+    }
+
+    #[test]
     fn collect_unique_hyperlinks() {
         let mut term = mock_term("000\r\n111");
         term.goto(0, 0);
@@ -699,5 +893,77 @@ mod tests {
 
         // The iterator should match everything in the viewport.
         assert_eq!(visible_regex_match_iter(&term, &mut regex).count(), 4096);
+    }
+
+    const PATH_REGEX: &str = "(/[A-Za-z0-9._-]+)+";
+
+    fn wrapped_text(content: &str, regex: &str, point: Point) -> Option<String> {
+        let term = mock_term(content);
+        let mut regex = RegexSearch::new(regex).unwrap();
+        wrapped_regex_match_at(&term, point, &mut regex, true).map(|wrapped| wrapped.text(&term))
+    }
+
+    #[test]
+    fn path_hard_wrapped_at_a_pane_rule_continues_on_the_next_row() {
+        // A vc-frame pane between two others; the program broke the path at
+        // the pane edge and indented the rest.
+        let content = "s│run /tmp/claude/wrap-│r\r\ns│  ped/report.log done│r";
+        let joined = Some(String::from("/tmp/claude/wrap-ped/report.log"));
+
+        // Pointing at either row opens the whole path.
+        assert_eq!(wrapped_text(content, PATH_REGEX, Point::new(Line(0), Column(8))), joined);
+        assert_eq!(wrapped_text(content, PATH_REGEX, Point::new(Line(1), Column(5))), joined);
+
+        // The neighbouring pane and the indentation are not part of the link.
+        let term = mock_term(content);
+        let mut regex = RegexSearch::new(PATH_REGEX).unwrap();
+        let wrapped =
+            wrapped_regex_match_at(&term, Point::new(Line(1), Column(5)), &mut regex, true)
+                .unwrap();
+        assert_eq!(wrapped.head, Point::new(Line(0), Column(6))..=Point::new(Line(0), Column(22)));
+        assert_eq!(wrapped.tail, vec![
+            Point::new(Line(1), Column(4))..=Point::new(Line(1), Column(17))
+        ]);
+
+        // Text after the continuation word is not a link.
+        assert_eq!(wrapped_text(content, PATH_REGEX, Point::new(Line(1), Column(20))), None);
+    }
+
+    #[test]
+    fn url_hard_wrapped_at_the_window_edge_continues_on_the_next_row() {
+        let content = "see https://example.com/a/very-lon\r\ng/path ok";
+        let url = "https://[a-z./-]+";
+
+        let joined = Some(String::from("https://example.com/a/very-long/path"));
+        assert_eq!(wrapped_text(content, url, Point::new(Line(0), Column(10))), joined);
+        assert_eq!(wrapped_text(content, url, Point::new(Line(1), Column(1))), joined);
+    }
+
+    #[test]
+    fn match_ending_before_the_edge_stays_on_its_row() {
+        // Word wrapping moved `next/thing` down; it does not continue the path.
+        let content = "s│see /tmp/a.log    │r\r\ns│next/thing        │r";
+
+        let text = wrapped_text(content, PATH_REGEX, Point::new(Line(0), Column(8)));
+        assert_eq!(text, Some(String::from("/tmp/a.log")));
+    }
+
+    #[test]
+    fn interface_glyphs_on_the_next_row_do_not_continue_the_link() {
+        // Tool output marker and a pane frame below a path that fills its row.
+        let marker = "s│run /tmp/claude/wrap-│r\r\ns│  ⎿ done            │r";
+        let frame = "s│run /tmp/claude/wrap-│r\r\ns└────────────────────┘r";
+
+        let path = Some(String::from("/tmp/claude/wrap-"));
+        assert_eq!(wrapped_text(marker, PATH_REGEX, Point::new(Line(0), Column(8))), path);
+        assert_eq!(wrapped_text(frame, PATH_REGEX, Point::new(Line(0), Column(8))), path);
+    }
+
+    #[test]
+    fn sentence_punctuation_after_a_wrapped_link_is_dropped() {
+        let content = "s│run /tmp/claude/wrap-│r\r\ns│  ped/report.log).  │r";
+
+        let text = wrapped_text(content, PATH_REGEX, Point::new(Line(0), Column(8)));
+        assert_eq!(text, Some(String::from("/tmp/claude/wrap-ped/report.log")));
     }
 }

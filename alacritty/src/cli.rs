@@ -21,6 +21,11 @@ use crate::logging::LOG_TARGET_IPC_CONFIG;
 #[derive(Parser, Default, Debug)]
 #[clap(author, about, version = env!("VERSION"))]
 pub struct Options {
+    /// Hosted window helper; the product's signed Main owns the public app.
+    #[cfg(target_os = "macos")]
+    #[clap(long, hide = true)]
+    pub vibecrafted_hosted: bool,
+
     /// Print all events to STDOUT.
     #[clap(long)]
     pub print_events: bool,
@@ -33,8 +38,9 @@ pub struct Options {
     #[clap(long)]
     pub embed: Option<String>,
 
-    /// Specify alternative configuration file [default:
-    /// $XDG_CONFIG_HOME/alacritty/alacritty.toml].
+    /// Specify alternative configuration file. Defaults to
+    /// $HOME/.config/vibecrafted/vc-terminal/vc-terminal.toml when present,
+    /// otherwise searches legacy Alacritty locations (starting at $XDG_CONFIG_HOME).
     #[cfg(not(any(target_os = "macos", windows)))]
     #[clap(long, value_hint = ValueHint::FilePath)]
     pub config_file: Option<PathBuf>,
@@ -44,7 +50,10 @@ pub struct Options {
     #[clap(long, value_hint = ValueHint::FilePath)]
     pub config_file: Option<PathBuf>,
 
-    /// Specify alternative configuration file [default: $HOME/.config/alacritty/alacritty.toml].
+    /// Specify alternative configuration file. Defaults to
+    /// $HOME/.config/vibecrafted/vc-terminal/vc-terminal.toml when present,
+    /// otherwise searches legacy Alacritty locations (including
+    /// $HOME/.config/alacritty/alacritty.toml).
     #[cfg(target_os = "macos")]
     #[clap(long, value_hint = ValueHint::FilePath)]
     pub config_file: Option<PathBuf>,
@@ -200,6 +209,7 @@ impl From<TerminalOptions> for PtyOptions {
             shell: options.command().map(Into::into),
             drain_on_exit: options.hold,
             env: HashMap::new(),
+            child_exit_behavior: Default::default(),
             #[cfg(target_os = "windows")]
             escape_args: false,
         }
@@ -438,6 +448,18 @@ mod tests {
     #[cfg(target_os = "linux")]
     use clap_complete::Shell;
     use toml::Table;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn hosted_role_requires_an_explicit_argument() {
+        assert!(!Options::try_parse_from(["vc-terminal"]).unwrap().vibecrafted_hosted);
+        assert!(
+            Options::try_parse_from(["vc-terminal", "--vibecrafted-hosted"])
+                .unwrap()
+                .vibecrafted_hosted
+        );
+        assert!(Options::try_parse_from(["vc-terminal", "--vibecrafted-hosted=foreign"]).is_err());
+    }
 
     #[test]
     fn dynamic_title_ignoring_options_by_default() {

@@ -31,6 +31,8 @@ use winit::event::{
     Touch as TouchEvent, WindowEvent,
 };
 use winit::event_loop::{ActiveEventLoop, ControlFlow, DeviceEvents, EventLoop, EventLoopProxy};
+#[cfg(target_os = "macos")]
+use winit::platform::macos::ActiveEventLoopExtMacOS;
 use winit::raw_window_handle::HasDisplayHandle;
 use winit::window::WindowId;
 
@@ -231,6 +233,12 @@ impl ApplicationHandler<Event> for Processor {
     fn resumed(&mut self, _event_loop: &ActiveEventLoop) {}
 
     fn new_events(&mut self, event_loop: &ActiveEventLoop, cause: StartCause) {
+        #[cfg(target_os = "macos")]
+        if cause == StartCause::Init {
+            // Keep host windows separate regardless of the system's tab preference.
+            event_loop.set_allows_automatic_window_tabbing(false);
+        }
+
         if cause != StartCause::Init || self.cli_options.daemon {
             return;
         }
@@ -520,10 +528,10 @@ impl ApplicationHandler<Event> for Processor {
 #[derive(Debug, Clone)]
 pub struct Event {
     /// Limit event to a specific window.
-    window_id: Option<WindowId>,
+    pub(crate) window_id: Option<WindowId>,
 
     /// Event payload.
-    payload: EventType,
+    pub(crate) payload: EventType,
 }
 
 impl Event {
@@ -1774,6 +1782,11 @@ pub struct Mouse {
     pub click_state: ClickState,
     pub accumulated_scroll: AccumulatedScroll,
     pub cell_side: Side,
+    /// Command/Super hint gesture captured at press time.
+    ///
+    /// This belongs here rather than on the short-lived input `Processor`, since window events
+    /// are drained in separate batches and can recreate the processor between press and release.
+    pub hint_click: HintClickState,
     pub block_hint_launcher: bool,
     pub hint_highlight_dirty: bool,
     pub inside_text_area: bool,
@@ -1791,6 +1804,7 @@ impl Default for Mouse {
             right_button_state: ElementState::Released,
             click_state: ClickState::None,
             cell_side: Side::Left,
+            hint_click: Default::default(),
             hint_highlight_dirty: Default::default(),
             block_hint_launcher: Default::default(),
             inside_text_area: Default::default(),
@@ -1799,6 +1813,15 @@ impl Default for Mouse {
             y: Default::default(),
         }
     }
+}
+
+/// Persistent state of a command hint gesture.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum HintClickState {
+    #[default]
+    None,
+    Captured(MouseButton),
+    Canceled(MouseButton),
 }
 
 impl Mouse {
@@ -1983,6 +2006,9 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                     },
                     WindowEvent::Touch(touch) => self.touch(touch),
                     WindowEvent::Focused(is_focused) => {
+                        if !is_focused {
+                            self.cancel_hint_click();
+                        }
                         self.ctx.terminal.is_focused = is_focused;
 
                         // When the unfocused hollow is used we must redraw on focus change.
